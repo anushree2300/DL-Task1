@@ -1,6 +1,6 @@
 import cv2
 import numpy as np
-import mediapipe as mp
+import av
 import streamlit as st
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
 
@@ -8,93 +8,76 @@ from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfigurati
 RTC_CONFIGURATION = RTCConfiguration({
     "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
 })
-FRAME_WIDTH = 640
-FRAME_HEIGHT = 480
-CENTER_THRESHOLD = 0.15  # fraction of frame size
+W, H = 640, 480
+CENTER_ZONE = 0.15  # fraction
 
-# ---- MEDIAPIPE SETUP ----
-mp_face_detection = mp.solutions.face_detection.FaceDetection(
-    model_selection=0, min_detection_confidence=0.5
+# ---- LOAD CASCADES ----
+face_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 )
-mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
-    static_image_mode=False,
-    max_num_faces=1,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
+eye_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_eye.xml"
 )
 
 class FaceAnalyzer(VideoProcessorBase):
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
-        img = cv2.resize(img, (FRAME_WIDTH, FRAME_HEIGHT))
+        img = cv2.resize(img, (W, H))
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        # Face detection
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        det = mp_face_detection.process(rgb)
-        centered = "No face"
-        looking = "N/A"
+        faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(100,100))
+        posture = "No face"
+        gaze    = "N/A"
 
-        if det.detections:
-            d = det.detections[0]
-            # bounding box
-            bbox = d.location_data.relative_bounding_box
-            x1 = int(bbox.xmin * FRAME_WIDTH)
-            y1 = int(bbox.ymin * FRAME_HEIGHT)
-            w  = int(bbox.width * FRAME_WIDTH)
-            h  = int(bbox.height * FRAME_HEIGHT)
-            cx, cy = x1 + w//2, y1 + h//2
+        if len(faces):
+            x, y, w, h = faces[0]
+            cx, cy = x + w//2, y + h//2
 
-            # draw box + center marker
-            cv2.rectangle(img, (x1,y1), (x1+w, y1+h), (0,255,0), 2)
+            # Draw face box + center dot
+            cv2.rectangle(img, (x,y), (x+w,y+h), (0,255,0), 2)
             cv2.circle(img, (cx,cy), 5, (0,0,255), -1)
 
-            # posture: is face center within central zone?
-            x_low = int(FRAME_WIDTH*(0.5 - CENTER_THRESHOLD))
-            x_high = int(FRAME_WIDTH*(0.5 + CENTER_THRESHOLD))
-            y_low = int(FRAME_HEIGHT*(0.5 - CENTER_THRESHOLD))
-            y_high = int(FRAME_HEIGHT*(0.5 + CENTER_THRESHOLD))
-            cv2.rectangle(img, (x_low, y_low), (x_high, y_high), (255,255,0), 1)
-            centered = "Centered" if (x_low < cx < x_high and y_low < cy < y_high) else "Not centered"
+            # Central “posture” box
+            xl = int(W*(0.5 - CENTER_ZONE))
+            xh = int(W*(0.5 + CENTER_ZONE))
+            yl = int(H*(0.5 - CENTER_ZONE))
+            yh = int(H*(0.5 + CENTER_ZONE))
+            cv2.rectangle(img, (xl, yl), (xh, yh), (255,255,0), 1)
+            posture = "Centered" if (xl < cx < xh and yl < cy < yh) else "Not centered"
 
-            # face mesh for iris landmarks → approximate gaze
-            mesh = mp_face_mesh.process(rgb)
-            if mesh.multi_face_landmarks:
-                lm = mesh.multi_face_landmarks[0].landmark
-                # left iris center ≈ mean of landmarks 474–478
-                left = np.mean([[lm[i].x, lm[i].y] for i in range(474,479)], axis=0)
-                right = np.mean([[lm[i].x, lm[i].y] for i in range(469,474)], axis=0)
-                # convert to pixel coords
-                l_px = np.array([left[0]*FRAME_WIDTH, left[1]*FRAME_HEIGHT])
-                r_px = np.array([right[0]*FRAME_WIDTH, right[1]*FRAME_HEIGHT])
-                # if both irises are close to frame center horizontally → looking forward
-                avg_x = (l_px[0] + r_px[0]) / 2
-                looking = "Looking" if abs(avg_x - FRAME_WIDTH/2) < w*0.15 else "Not looking"
+            # Gaze: look for two eyes, check vertical alignment
+            eyes = eye_cascade.detectMultiScale(
+                gray[y:y+h, x:x+w], scaleFactor=1.1, minNeighbors=5
+            )
+            if len(eyes) >= 2:
+                eyes = sorted(eyes, key=lambda e: e[2]*e[3], reverse=True)[:2]
+                e1, e2 = eyes[0], eyes[1]
+                y1 = y + e1[1] + e1[3]//2
+                y2 = y + e2[1] + e2[3]//2
+                gaze = "Looking" if abs(y1 - y2) < h*0.1 else "Not looking"
 
-        # overlay text
-        cv2.putText(img, f"Posture: {centered}", (10,25),
+        # Overlay
+        cv2.putText(img, f"Posture: {posture}", (10,30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
-        cv2.putText(img, f"Gaze: {looking}", (10,60),
+        cv2.putText(img, f"Gaze: {gaze}", (10,65),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
 
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-# ---- STREAMLIT UI ----
-st.title("🔴 Live Webcam Analytics")
+st.title("🔴 Live Webcam Analytics (Haar Cascade)")
 st.markdown(
     """
-    - **Face position**: box + center marker  
-    - **Posture**: is your face in the central zone?  
-    - **Gaze**: looking straight at camera or not  
+    - **Face**: Haar‐cascade detection  
+    - **Posture**: am I centered?  
+    - **Gaze**: simple eye‐alignment check  
     """
 )
 
 webrtc_streamer(
-    key="face-analytics",
+    key="haar-face",
     mode="SENDRECV",
     rtc_configuration=RTC_CONFIGURATION,
     video_processor_factory=FaceAnalyzer,
-    media_stream_constraints={
-        "video": {"width": FRAME_WIDTH, "height": FRAME_HEIGHT},
-        "audio": False
-    }
+    media_stream_constraints={"video": {"width": W, "height": H}, "audio": False},
 )
+
